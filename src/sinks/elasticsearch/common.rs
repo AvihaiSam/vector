@@ -18,7 +18,7 @@ use crate::{
     http::{Auth, HttpClient, MaybeAuth},
     sinks::{
         elasticsearch::{
-            ElasticsearchAuth, ElasticsearchCommonMode, ElasticsearchConfig, ParseError,
+            ElasticsearchAuth, ElasticsearchCommonMode, ElasticsearchConfig, ParseError, OpensearchClusterType,
         },
         util::{http::RequestConfig, TowerRequestConfig, UriSerde},
         HealthcheckError,
@@ -33,6 +33,7 @@ pub struct ElasticsearchCommon {
     pub bulk_uri: Uri,
     pub http_auth: Option<Auth>,
     pub aws_auth: Option<SharedCredentialsProvider>,
+    pub aws_service: String,
     pub mode: ElasticsearchCommonMode,
     pub request_builder: ElasticsearchRequestBuilder,
     pub tls_settings: TlsSettings,
@@ -126,8 +127,16 @@ impl ElasticsearchCommon {
 
         let region = config.aws.as_ref().and_then(|config| config.region());
 
+        let aws_service = match config.opensearch_cluster_type {
+            OpensearchClusterType::Managed => "es",
+            OpensearchClusterType::Serverless => "aoss",
+        }.to_string();
+
         let version = if let Some(version) = *version {
             version
+        } else if aws_service == "aoss" {
+            // if aws_service is "aoss", cluster-version API does not exist
+            8
         } else {
             let ver = match config.api_version {
                 ElasticsearchApiVersion::V6 => 6,
@@ -135,6 +144,7 @@ impl ElasticsearchCommon {
                 ElasticsearchApiVersion::V8 => 8,
                 ElasticsearchApiVersion::Auto => {
                     match get_version(
+                        &aws_service,
                         &base_url,
                         &http_auth,
                         &aws_auth,
@@ -194,6 +204,7 @@ impl ElasticsearchCommon {
             base_url,
             bulk_uri,
             aws_auth,
+            aws_service,
             mode,
             request_builder,
             query_params,
@@ -241,33 +252,41 @@ impl ElasticsearchCommon {
     }
 
     pub async fn healthcheck(self, client: HttpClient) -> crate::Result<()> {
-        match get(
-            &self.base_url,
-            &self.http_auth,
-            &self.aws_auth,
-            &self.region,
-            &self.request,
-            client,
-            "/_cluster/health",
-        )
-        .await?
-        .status()
-        {
-            StatusCode::OK => Ok(()),
-            status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
+        if &self.aws_service != "aoss" {
+            match get(
+                &self.aws_service,
+                &self.base_url,
+                &self.http_auth,
+                &self.aws_auth,
+                &self.region,
+                &self.request,
+                client,
+                "/_cluster/health",
+            )
+            .await?
+            .status()
+            {
+                StatusCode::OK => Ok(()),
+                status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
+            }
+        } else {
+            warn!(message = "AWS OpenSearch Serverless does not support healthchecks. Skipping healthcheck...");
+            Ok(())
         }
     }
 }
 
 pub async fn sign_request(
+    aws_service: &str,
     request: &mut http::Request<Bytes>,
     credentials_provider: &SharedCredentialsProvider,
     region: &Option<Region>,
 ) -> crate::Result<()> {
-    crate::aws::sign_request("es", request, credentials_provider, region).await
+    crate::aws::sign_request(aws_service, request, credentials_provider, region).await
 }
 
 async fn get_version(
+    aws_service: &str,
     base_url: &str,
     http_auth: &Option<Auth>,
     aws_auth: &Option<SharedCredentialsProvider>,
@@ -283,6 +302,7 @@ async fn get_version(
 
     let client = HttpClient::new(tls_settings.clone(), proxy_config)?;
     let response = get(
+        aws_service,
         base_url,
         http_auth,
         aws_auth,
@@ -302,6 +322,7 @@ async fn get_version(
 }
 
 async fn get(
+    aws_service: &str,
     base_url: &str,
     http_auth: &Option<Auth>,
     aws_auth: &Option<SharedCredentialsProvider>,
@@ -323,7 +344,7 @@ async fn get(
     let mut request = builder.body(Bytes::new())?;
 
     if let Some(credentials_provider) = aws_auth {
-        sign_request(&mut request, credentials_provider, region).await?;
+        sign_request(&aws_service, &mut request, credentials_provider, region).await?;
     }
     client
         .send(request.map(hyper::Body::from))

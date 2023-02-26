@@ -65,7 +65,7 @@ impl ElasticsearchCommon {
         let mut request = builder.body(Bytes::new())?;
 
         if let Some(credentials_provider) = &self.aws_auth {
-            sign_request(&mut request, credentials_provider, &self.region).await?;
+            sign_request(&self.aws_service, &mut request, credentials_provider, &self.region).await?;
         }
 
         let proxy = ProxyConfig::default();
