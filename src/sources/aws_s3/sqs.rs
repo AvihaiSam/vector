@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::{future::ready, num::NonZeroUsize, panic, sync::Arc};
+use std::{future::ready, num::NonZeroUsize, panic, sync::Arc, time::Duration};
 
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::Client as S3Client;
@@ -20,7 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
-use tokio::{pin, select};
+use tokio::{pin, select, time};
 use tokio_util::codec::FramedRead;
 use tracing::Instrument;
 use vector_lib::codecs::decoding::FramingError;
@@ -329,13 +329,20 @@ impl IngestorProcess {
     }
 
     async fn run_once(&mut self) {
-        let messages = self.receive_messages().await;
+        let timeout_duration = Duration::from_secs(self.state.poll_secs as u64 + 5);
+        let messages = time::timeout(timeout_duration, self.receive_messages()).await;
         let messages = messages
-            .map(|messages| {
-                emit!(SqsMessageReceiveSucceeded {
-                    count: messages.len(),
-                });
-                messages
+            .map(|result| match result {
+                Ok(messages) => {
+                    emit!(SqsMessageReceiveSucceeded {
+                        count: messages.len(),
+                    });
+                    messages
+                }
+                Err(err) => {
+                    emit!(SqsMessageReceiveError { error: &err });
+                    Vec::new() // or handle the error case appropriately
+                }
             })
             .map_err(|err| {
                 emit!(SqsMessageReceiveError { error: &err });
